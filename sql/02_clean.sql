@@ -89,7 +89,10 @@ ORDER BY COUNT(*) DESC;
 -- What we see is that these are normal requests such as potholes, recycling violations, etc.
 -- They just have no case owner
 
--- DECISION: NO referral exclusion by owner, this will overall make the data much cleaner to work on.
+-- DECISION: (1) No referral exclusion by owner: 
+-- no department shows the referral pattern (all under 1% instant). 
+-- (2) Exclude rows where case_owner = '' (no responsible department; 
+-- instant rate 7x higher than assigned requests).
 
 
 -- =====================================================================
@@ -99,14 +102,76 @@ ORDER BY COUNT(*) DESC;
 -- Requests created after that haven't had a fair chance to close.
 
 -- C1: Are new-era open requests recent or months old? (e.g., count open requests by created month)
--- TODO
+SELECT substr(created_date_et, 1, 7) AS created_month,
+       COUNT(*) AS total,
+       SUM(status NOT LIKE '%Closed%') AS still_open,
+       ROUND(100.0 * SUM(status NOT LIKE '%Closed%') / COUNT(*), 1) AS pct_open
+FROM requests
+WHERE created_date_et >= '2025-02-04' AND case_owner != ''
+GROUP BY created_month
+ORDER BY created_month;
+-- Result: Open share never falls below ~11%; 
+-- ~15% of requests over a year old are still open. 
+-- 90-day cutoff alone does not fix censoring.
+
+-- C1b: Which subjects have the most never-closed requests? (new era, 90+ days old, no blank owner)
+SELECT subject, COUNT(*) AS total,
+       SUM(status NOT LIKE '%Closed%') AS still_open,
+       ROUND(100.0 * SUM(status NOT LIKE '%Closed%') / COUNT(*), 1) AS pct_open
+FROM requests
+WHERE created_date_et >= '2025-02-04' AND created_date_et < '2026-08-07' AND case_owner != ''
+GROUP BY subject
+HAVING COUNT(*) >= 100
+ORDER BY pct_open DESC;
+
+-- Result: never-closed requests are concentrated in planning/feedback, enforcement, police and
+--         outside-agency subjects (93-100% open: Traffic Calming, Crashes and Close Calls, Paving
+--         Request, Bicycle Safety...). Core services (potholes, pickups, streetlights) not in top 30.
+-- Meaning: for those subjects "closed" isn't the expected outcome -> restrict scope to physical services,
+--          chosen by what the request IS, not by its open share (that would be circular).
+
+
+-- C1c: Open share for the highest-volume subjects
+SELECT subject, COUNT(*) AS total,
+       SUM(status NOT LIKE '%Closed%') AS still_open,
+       ROUND(100.0 * SUM(status NOT LIKE '%Closed%') / COUNT(*), 1) AS pct_open
+FROM requests
+WHERE created_date_et >= '2025-02-04' AND created_date_et < '2026-08-07' AND case_owner != ''
+GROUP BY subject
+HAVING COUNT(*) >= 100
+ORDER BY total DESC
+LIMIT 25;
 
 -- Result:
+-- DECISION (scope): keep 8 physical city-crew services with >= ~1,500 requests: Missed Pick Up, Potholes,
+--   Street Light Concerns, Litter on Public Property, Repair or Replace a Sign, Street Cleaning/Sweeping,
+--   City Tree Maintenance, Overgrowth.
+-- DECISION (outcome): closed within 30 days, so still-open requests count instead of being dropped.
 
--- C2: % still open by neighborhood (new era, created before the cutoff)
--- TODO
+-- C1d: Who handles the unclear subjects? (new era, 90+ days old, no blank owner)
+-- Purpose: decide scope by what the service IS (who does the work), not by its open share.
+SELECT subject,
+       case_owner,
+       COUNT(*) AS num_requests
+FROM requests
+WHERE created_date_et >= '2025-02-04'
+  AND created_date_et < '2026-08-07'
+  AND case_owner <> ''
+  AND subject IN ('Refuse or Recycling Violations', 'Weeds or Debris', 'Overgrowth', 'Snow/Ice Removal')
+GROUP BY subject, case_owner
+ORDER BY subject, num_requests DESC;
 
 -- Result:
+--   Refuse or Recycling Violations -> main owner: DPW – Street Maintenance
+--   Weeds or Debris                -> main owner: PLI - Permits, Licenses, and Inspections
+--   Overgrowth                     -> main owner: DPW ES Enforcement
+--   Snow/Ice Removal               -> bulk-closed (0.0% open, Jan 2026 storm spike)
+-- Rule: city crew department (e.g., DPW) = service -> keep; inspection/permits/enforcement = exclude.
+-- Result: Overgrowth -> DPW Street Maintenance (crews, keep); Weeds or Debris -> PLI (inspections of
+--   private property, exclude); Refuse or Recycling Violations -> DPW ES Enforcement (exclude);
+--   Snow/Ice Removal -> DPW crews but bulk-closed after the Jan 2026 storm (exclude).
+
+-- C2: cut. Superseded by the outcome decision (closed within 30 days); per-neighborhood rates are in section F and Phase 3.
 
 
 -- =====================================================================
