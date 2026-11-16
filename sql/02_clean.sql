@@ -177,47 +177,208 @@ ORDER BY subject, num_requests DESC;
 -- =====================================================================
 -- D. RESPONSE TIME: compute in UTC and check for impossible values
 -- =====================================================================
--- Use created_date_utc / closed_date_utc: ET times shift an hour at daylight-saving changes.
+--Use this to clear current view
+DROP VIEW IF EXISTS in_scope;
+--View base being used from now on 
+CREATE VIEW in_scope AS
+SELECT *
+FROM requests
+WHERE created_date_et >= '2025-02-04'              -- A: new system only
+  AND created_date_et < '2026-10-06'               -- C: 30-day eligibility cutoff (download 2026-11-05)
+  AND case_owner <> ''                             -- B: owner assigned
+  AND subject IN ('Missed Pick Up', 'Potholes', 'Street Light Concerns', 'Litter on Public Property',
+                  'Repair or Replace a Sign', 'Street Cleaning/Sweeping', 'City Tree Maintenance',
+                  'Overgrowth');                   -- C: 8 physical city-crew services
+
+SELECT COUNT(*) AS in_scope_rows FROM in_scope;
+-- Result: 49,440 rows (funnel: 981,193 -> 49,440)
+
+-- Response time uses UTC columns: ET times shift an hour at daylight-saving changes.
 -- Response time in hours: (julianday(closed_date_utc) - julianday(created_date_utc)) * 24
 
--- D1: Any requests closed BEFORE they were created? Any open > 1 year?
--- TODO
+-- D1: Any requests closed BEFORE they were created? (data errors)
+SELECT COUNT(*) AS closed_before_created
+FROM in_scope
+WHERE closed_date_utc <> ''
+  AND julianday(closed_date_utc) < julianday(created_date_utc);
+-- Result: There are no requests closed before they were created
+
+
+-- D2: Status says closed, but there's no closed date? (can't compute a time)
+SELECT COUNT(*) AS closed_no_date
+FROM in_scope
+WHERE status LIKE '%Closed%'
+  AND closed_date_utc = '';
+-- Result: There are 7 requests that say they are closed but have no closed date
+
+
+-- D3: Status says NOT closed, but there IS a closed date? (reopened requests?)
+SELECT status, COUNT(*) AS open_with_date
+FROM in_scope
+WHERE status NOT LIKE '%Closed%'
+  AND closed_date_utc <> ''
+GROUP BY status
+ORDER BY open_with_date DESC;
+-- Result: 0 rows (no open requests have a closed date)
+
+
+-- D4: Closed after more than a year? (possible, but worth knowing how many)
+SELECT COUNT(*) AS over_one_year
+FROM in_scope
+WHERE closed_date_utc <> ''
+  AND julianday(closed_date_utc) - julianday(created_date_utc) > 365;
+-- Result: 100 requests are closed after more than a year
+
+-- DECISION (outcome definition): closed_within_30d = 1 if closed_date_utc <> '' AND
+--   response time <= 30 hours; otherwise 0 (open requests and late closures count as 0).
+-- DECISION (exclusions): drop the 7 rows marked Closed with no closed date (D2).
+--   Keep the 100 closed after >1 year (D4): real slow cases, coded 0.
+
+
+-- =====================================================================
+-- E. SIMPLE EXCLUSIONS: duplicates, Canceled, blank neighborhood
+-- =====================================================================
+-- (Blank subject is impossible here: in_scope only keeps the 8 named subjects.)
+
+-- E1: How many in-scope rows are duplicates?
+SELECT COUNT(*) AS num_duplicates
+FROM in_scope
+WHERE status LIKE '%Duplicate%';
+-- Result: 1,516 (3.1%). Higher than 0.79% overall: physical problems get reported by several neighbors.
+
+-- E2: How many are Canceled?
+SELECT COUNT(*) AS num_canceled
+FROM in_scope
+WHERE status = 'Canceled';
+-- Result: 0 (the one Canceled row was outside the 8 services).
+
+-- E3: How many have a blank neighborhood?
+SELECT COUNT(*) AS blank_neighborhood
+FROM in_scope
+WHERE neighborhood = '';
+-- Result: 506 (1.0%). Can't be assigned to a neighborhood.
+
+-- E4: How many in-scope requests closed within 30 days? (before exclusions)
+SELECT COUNT(*) AS closed_in_30
+FROM in_scope
+WHERE closed_date_utc <> ''
+  AND julianday(closed_date_utc) - julianday(created_date_utc) <= 30;
+-- Result: 35,488 of 49,440 = 71.8%.
+
+-- E5: Final row count with ALL exclusions applied at once
+SELECT COUNT(*) AS final_rows
+FROM in_scope
+WHERE status NOT LIKE '%Duplicate%'
+  AND status <> 'Canceled'
+  AND neighborhood <> ''
+  AND NOT (status LIKE '%Closed%' AND closed_date_utc = '');   -- D2 rows
+-- Result: 47,458. Subtracting exclusion counts gives 47,411; the 47-row gap is rows in
+--   two exclusion groups at once (e.g., a duplicate with a blank neighborhood), which
+--   subtraction removes twice. Always compute the final count in one query.
+
+-- DECISION: exclude duplicates (status LIKE '%Duplicate%'), Canceled, blank neighborhood,
+--   and the 7 D2 rows (marked Closed with no closed date).
+
+
+-- =====================================================================
+-- G. FINAL ANALYSIS VIEW   (build this BEFORE section F)
+-- =====================================================================
+-- analysis = in_scope + every exclusion from D and E, with only the columns the model needs:
+--   neighborhood, subject, created_date_utc, and closed_within_30d (1 = closed within 30 days, else 0).
+-- Open the database in normal (not read-only) mode and click Write Changes afterward.
+
+DROP VIEW IF EXISTS analysis;
+CREATE VIEW analysis AS
+SELECT neighborhood,
+       subject,
+       created_date_utc,
+       (closed_date_utc <> '' AND julianday(closed_date_utc) - julianday(created_date_utc) <= 30) AS closed_within_30d
+FROM in_scope
+WHERE status NOT LIKE '%Duplicate%'
+  AND status <> 'Canceled'
+  AND neighborhood <> ''
+  AND NOT (status LIKE '%Closed%' AND closed_date_utc = '');
+
+-- Check: SELECT COUNT(*) FROM analysis;   -- should be 47,458
+-- Result: 
+SELECT COUNT(*) FROM analysis; -- 47,458
+SELECT closed_within_30d, COUNT(*) FROM analysis GROUP BY closed_within_30d; --0	12963, 1	34495
+SELECT AVG(closed_within_30d) FROM analysis; --0.73
+
+
+-- =====================================================================
+-- F. SAMPLE SIZE: requests per neighborhood   (run AFTER the analysis view exists)
+-- =====================================================================
+
+-- F1: How many distinct neighborhoods are there? (Pittsburgh officially has 90)
+SELECT COUNT(DISTINCT neighborhood)
+FROM analysis;
+-- Result: 95
+
+-- F2: Requests per neighborhood, with the raw (unadjusted) 30-day closure rate, smallest first
+SELECT neighborhood, ROUND(AVG(closed_within_30d)*100,1), COUNT(*) AS num_requests
+FROM analysis
+GROUP BY neighborhood
+ORDER BY COUNT(*);
 
 -- Result:
--- DECISION:
+--Arlington Heights	78.6	14
+--Block Group 4	57.8	45
+--St. Clair	77.6	49
+--Glen Hazel	74.1	54
+--Northview Heights	81.5	54
+--Esplen	80.0	60
+--Ridgemont	91.9	62
+--East Carnegie	82.7	75
+--South Shore	57.1	77
+--Mt. Oliver	75.6	90
+--Bedford Dwellings	68.8	96
+--Oakwood	78.3	106
+--Chateau	67.0	112
+--North Shore	65.2	112
 
+-- Note: raw rates are confounded by request mix (e.g., tree-heavy neighborhoods look slow);
+--   the Phase 3 regression separates neighborhood from request type. 
+-- BLOCK GROUPS aren't neighborhoods, and are census use only, so we will ignore them. There are 5 block groups, which explains why there are 95 distinct neighborhoods in F1.
+-- DECISION: minimum requests per neighborhood = 50, I chose 50 rather than 100 because a stricter cutoff would drop several small, lower-income neighborhoods that matter most for the question
+
+
+--rewritten analysis scope to exclude the block groups
+DROP VIEW IF EXISTS analysis;
+CREATE VIEW analysis AS
+SELECT neighborhood,
+       subject,
+       created_date_utc,
+       (closed_date_utc <> '' AND julianday(closed_date_utc) - julianday(created_date_utc) <= 30) AS closed_within_30d
+FROM in_scope
+WHERE status NOT LIKE '%Duplicate%'
+  AND status <> 'Canceled'
+  AND neighborhood <> ''
+  AND NOT (status LIKE '%Closed%' AND closed_date_utc = '')
+  AND neighborhood NOT LIKE '%Block Group%';
+
+--new 'model data' view to exclude neighborhoods under 50 requests
+DROP VIEW IF EXISTS model_data;
+CREATE VIEW model_data AS
+SELECT *
+FROM analysis
+WHERE neighborhood IN (
+    SELECT neighborhood
+    FROM analysis
+    GROUP BY neighborhood
+    HAVING COUNT(*) >= 50
+);
+
+-- Result: 46,875 rows, 88 neighborhoods, 72.7% closed within 30 days.
 
 -- =====================================================================
--- E. SIMPLE EXCLUSIONS: duplicates, Canceled, blank neighborhood/subject
+-- CLEANING FUNNEL (for the README) - fill with CUMULATIVE counts in Phase 4
 -- =====================================================================
-
--- E1: How many new-era rows have a blank neighborhood or blank subject?
--- TODO
-
--- Result:
--- DECISION: exclude duplicates (LIKE '%Duplicate%'), the Canceled status, and ____
-
-
--- =====================================================================
--- F. SAMPLE SIZE: requests per neighborhood after cleaning
--- =====================================================================
-
--- F1: Count of cleaned requests per neighborhood, smallest first
--- TODO
-
--- Result:
--- DECISION: minimum requests per neighborhood = ____
-
-
--- =====================================================================
--- G. FINAL ANALYSIS TABLE
--- =====================================================================
--- Build a VIEW that applies every DECISION above and outputs one row per request with:
--- neighborhood, subject, created time, response time in hours (UTC).
--- Note: open the database in normal (not read-only) mode in DB Browser to create a view,
--- and click Write Changes afterward.
--- TODO: CREATE VIEW analysis AS ...
-
--- Rows remaining after each step (for the README's cleaning funnel):
--- Start: 981,193 -> after date range: ____ -> after duplicates/Canceled/blanks: ____
---   -> after referrals: ____ -> after censoring cutoff: ____ -> after impossible values: ____
+-- All rows:                                              981,193
+-- + new system only (created >= 2025-02-04):             175,980
+-- + 30-day eligibility cutoff (created < 2026-10-06):    ____
+-- + owner assigned (case_owner <> ''):                   ____
+-- + 8 physical city-crew services:                        49,440
+-- + exclusions (duplicates, Canceled, blank
+--   neighborhood, closed-without-date):                   47,458
+-- + minimum-sample rule (section F):                     ____
