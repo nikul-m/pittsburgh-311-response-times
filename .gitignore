@@ -222,3 +222,4 @@ data/
 
 # macOS
 .DS_Store
+*.sqbpro
